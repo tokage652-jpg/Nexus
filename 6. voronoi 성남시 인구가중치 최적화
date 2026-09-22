@@ -15,12 +15,12 @@ plt.rcParams['axes.unicode_minus'] = False
 # =========================================================
 # 0. 파일 경로
 # =========================================================
-BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\HangJeongDong_ver20260701.geojson"
-FACILITY_CSV_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\소방서.csv"
-POPULATION_CSV_PATH = r"C:\Users\Lenovo\Downloads\_census_reqdoc_1784693050351\2024년_인구_다사_100M.csv"
+BOUNDARY_GEOJSON_PATH = r"파일경로"
+FACILITY_CSV_PATH = r"파일경로"
+POPULATION_CSV_PATH = r"파일경로"
 CITY_KEYWORD = "성남시"
 NAME_KEY_CANDIDATES = ["SIG_KOR_NM", "sggnm", "ADM_NM", "adm_nm", "SGG_NM", "sido_sgg_nm"]
-GRID_BOUNDARY_PATH = r"C:\Users\Lenovo\Downloads\_grid_border_grid_2025_grid_다사_grid_다사\grid_다사_100M.shp"
+GRID_BOUNDARY_PATH = r"파일경로"
 
 # =========================================================
 # 1. 최적화 설정값
