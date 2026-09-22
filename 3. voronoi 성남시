@@ -14,8 +14,8 @@ from pyproj import Transformer
 # =========================================================
 # 0. 파일 경로 - 실제로 다운로드한 파일 경로로 바꿔주세요
 # =========================================================
-BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 파일경로"
-FACILITY_CSV_PATH = r"C:\Users\Lenovo\OneDrive - 파일경로"
+BOUNDARY_GEOJSON_PATH = r"파일경로"
+FACILITY_CSV_PATH = r"파일경로"
 CITY_KEYWORD = "성남시"
 
 # =========================================================
