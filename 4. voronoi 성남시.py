@@ -1,0 +1,184 @@
+import json
+import numpy as np
+import pandas as pd
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+plt.rcParams['font.family'] = 'Malgun Gothic'
+plt.rcParams['axes.unicode_minus'] = False
+from scipy.spatial import cKDTree
+
+# pip install pyproj 필요 (위도/경도를 미터 단위 좌표로 바꾸기 위함)
+from pyproj import Transformer
+
+# =========================================================
+# 0. 파일 경로 - 실제로 다운로드한 파일 경로로 바꿔주세요
+# =========================================================
+BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\HangJeongDong_ver20260701.geojson"
+FACILITY_CSV_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\소방서.csv"
+CITY_KEYWORD = "성남시"
+
+# =========================================================
+# 1. 경계 GeoJSON에서 "성남시"에 해당하는 폴리곤들 추출
+# =========================================================
+NAME_KEY_CANDIDATES = ["SIG_KOR_NM", "sggnm", "ADM_NM", "adm_nm", "SGG_NM", "sido_sgg_nm"]
+
+with open(BOUNDARY_GEOJSON_PATH, encoding="utf-8") as f:
+    geojson_obj = json.load(f)
+
+def extract_city_polygons(geojson_obj, name_keys, keyword):
+    polygons = []
+    for feat in geojson_obj["features"]:
+        props = feat["properties"]
+        name_val = None
+        for k in name_keys:
+            if k in props and props[k] is not None:
+                name_val = str(props[k])
+                break
+        if name_val is None or keyword not in name_val:
+            continue
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            polygons.append(np.array(geom["coordinates"][0])[:, :2])
+        elif geom["type"] == "MultiPolygon":
+            for part in geom["coordinates"]:
+                polygons.append(np.array(part[0])[:, :2])
+    return polygons
+
+boundary_polys_lonlat = extract_city_polygons(geojson_obj, NAME_KEY_CANDIDATES, CITY_KEYWORD)
+print(f"[확인] '{CITY_KEYWORD}'로 매칭된 폴리곤(행정동) 개수: {len(boundary_polys_lonlat)}")
+if len(boundary_polys_lonlat) == 0:
+    print("  -> 0개면 NAME_KEY_CANDIDATES에 실제 속성 키가 없다는 뜻입니다.")
+    print("     geojson_obj['features'][0]['properties'] 를 출력해서 실제 키 이름을 확인하세요.")
+    print("     예:", geojson_obj["features"][0]["properties"])
+
+
+# =========================================================
+# 2. 좌표 변환 함수 (위도/경도 -> EPSG:5179 미터 단위)
+# =========================================================
+transformer = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
+
+def transform_lonlat(arr_lonlat):
+    x, y = transformer.transform(arr_lonlat[:, 0], arr_lonlat[:, 1])
+    return np.column_stack([x, y])
+
+boundary_polys = [transform_lonlat(p) for p in boundary_polys_lonlat]
+
+
+# =========================================================
+# 3. 소방서 좌표 로드 (현재 실제 배치)
+#    - 성남소방서 좌표 수동 보정(하대원동 신청사) + 중복 위치 제거 포함
+# =========================================================
+df_fac = pd.read_csv(FACILITY_CSV_PATH, encoding="cp949")
+ADDRESS_COL = "주소"
+LAT_COL = "X좌표"
+LON_COL = "Y좌표"
+df_fac_seongnam = df_fac[df_fac[ADDRESS_COL].astype(str).str.contains(CITY_KEYWORD, na=False)]
+facility_lonlat = df_fac_seongnam[[LON_COL, LAT_COL]].to_numpy(dtype=float)
+points = transform_lonlat(facility_lonlat)
+
+# [수동 보정] 성남소방서(공공데이터 주소: 수정구 제일로 111)는
+# 2022년 5월 중원구 하대원동 2로 신청사 이전. 공공데이터포털 CSV가
+# 구주소 기준으로 되어있어 실제 좌표로 직접 교체함.
+# 출처: 성남소방서 공식 홈페이지(119.gg.go.kr) "찾아오시는 길"
+seongnam_station_mask = df_fac_seongnam["소방서 및 안전센터명"] == "성남소방서"
+idx_in_points = np.where(seongnam_station_mask.to_numpy())[0][0]
+corrected = transform_lonlat(np.array([[127.1586809, 37.4223413]]))
+points[idx_in_points] = corrected[0]
+
+print(f"[확인] 성남시 소재 시설 개수: {len(points)}")
+
+# 좌표가 완전히 같은(중복 위치) 시설 제거 - 먼저 나온 것만 유지
+_, unique_idx = np.unique(points.round(3), axis=0, return_index=True)
+unique_idx = np.sort(unique_idx)
+points = points[unique_idx]
+df_fac_seongnam = df_fac_seongnam.iloc[unique_idx].reset_index(drop=True)
+print(f"중복 제거 후 시설 개수: {len(points)}")
+
+
+# =========================================================
+# 4. 점이 "성남시 소속 동 중 하나에라도" 속하는지 판정
+# =========================================================
+def point_in_single_polygon(px, py, poly):
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]
+        xj, yj = poly[j]
+        cond = ((yi > py) != (yj > py)) & \
+               (px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi)
+        inside ^= cond
+        j = i
+    return inside
+
+def point_in_city(px, py, polygons):
+    inside = np.zeros(len(px), dtype=bool)
+    for poly in polygons:
+        inside |= point_in_single_polygon(px, py, poly)
+    return inside
+
+
+# =========================================================
+# 5. 격자 생성 (성남시 전체를 감싸는 bounding box 기준)
+# =========================================================
+all_pts = np.vstack(boundary_polys)
+xmin, ymin = all_pts.min(axis=0)
+xmax, ymax = all_pts.max(axis=0)
+
+GRID_RESOLUTION = 300  # 처음엔 낮게 테스트하고, 필요하면 500~1000으로 올리세요 (계산량 급증 주의)
+
+xs = np.linspace(xmin, xmax, GRID_RESOLUTION)
+ys = np.linspace(ymin, ymax, GRID_RESOLUTION)
+gx, gy = np.meshgrid(xs, ys)
+gx_flat, gy_flat = gx.ravel(), gy.ravel()
+
+inside_mask = point_in_city(gx_flat, gy_flat, boundary_polys)
+grid_points = np.column_stack([gx_flat[inside_mask], gy_flat[inside_mask]])
+cell_area = (xmax - xmin) * (ymax - ymin) / (GRID_RESOLUTION ** 2) / 1e6  # 제곱킬로미터로 변환
+
+
+# =========================================================
+# 6. 이동거리 & 보로노이 폼 면적 계산
+# =========================================================
+tree = cKDTree(points)
+distances, nearest_idx = tree.query(grid_points)  # 단위: 미터
+distances = distances / 1000
+
+D_avg = distances.mean()
+D_max = distances.max()
+
+cell_areas = np.array([np.sum(nearest_idx == i) * cell_area for i in range(len(points))])
+A_bar = cell_areas.mean()
+sigma_A = cell_areas.std()
+CV_A = sigma_A / A_bar
+
+
+# =========================================================
+# 7. 공간 효율성 지표
+# =========================================================
+E = 1 / ((D_avg + D_max) * (1 + CV_A) * (D_max / D_avg))
+
+print("=" * 45)
+print(f"경계 내부 격자점 개수 : {len(grid_points):,}개")
+print(f"평균 이동거리 (km)    : {D_avg:.3f}")
+print(f"최대 이동거리 (km)    : {D_max:.3f}")
+print(f"면적 합 (㎢, 성남시 전체 면적과 비슷해야 함) : {cell_areas.sum():,.2f}")
+print(f"변동계수 (CV_A)      : {CV_A:.5f}")
+print(f"공간 효율성 지표 (E)  : {E:.6f}")
+print("=" * 45)
+
+
+# =========================================================
+# 8. 시각화
+# =========================================================
+fig, ax = plt.subplots(figsize=(7, 7))
+cmap = plt.get_cmap('tab20', len(points))
+ax.scatter(grid_points[:, 0], grid_points[:, 1], c=nearest_idx, cmap=cmap, s=2, marker='s')
+for poly in boundary_polys:
+    poly_closed = np.vstack([poly, poly[0]])
+    ax.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', linewidth=0.5, alpha=0.6)
+ax.plot(points[:, 0], points[:, 1], 'r^', markersize=8)
+ax.set_aspect('equal')
+ax.set_title(f"성남시 소방서 접근성 - Voronoi (E = {E:.4f})")
+plt.show()

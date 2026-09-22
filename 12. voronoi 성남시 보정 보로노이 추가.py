@@ -1,0 +1,365 @@
+import json
+import time
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from pyproj import Transformer
+
+plt.rcParams['font.family'] = 'Malgun Gothic'
+plt.rcParams['axes.unicode_minus'] = False
+
+# =========================================================
+# 0. 파일 경로
+# =========================================================
+BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\HangJeongDong_ver20260701.geojson"
+FACILITY_CSV_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\소방서.csv"
+POPULATION_CSV_PATH = r"C:\Users\Lenovo\Downloads\_census_reqdoc_1784693050351\2024년_인구_다사_100M.csv"   # SGIS 100m 격자 인구 자료
+CITY_KEYWORD = "성남시"
+NAME_KEY_CANDIDATES = ["SIG_KOR_NM", "sggnm", "ADM_NM", "adm_nm", "SGG_NM", "sido_sgg_nm"]
+GRID_BOUNDARY_PATH = r"C:\Users\Lenovo\Downloads\_grid_border_grid_2025_grid_다사_grid_다사\grid_다사_100M.shp"
+
+
+# =========================================================
+# 1. 골든타임 기준 설정
+#    - 평균 출동속도: 국민안전처 실측치 (5km 구간 평균 11분48초 -> 25.4km/h)
+#    - 우회계수: 직선거리 -> 도로거리 보정 (도심지역 일반적으로 1.3~1.4)
+#    - 골든타임: 소방·의료계 표준 5분
+# =========================================================
+AVG_SPEED_KMH = 25.4
+DETOUR_FACTOR = 1.218
+GOLDEN_TIME_MIN = 7
+
+road_distance_threshold_km = AVG_SPEED_KMH * (GOLDEN_TIME_MIN / 60)
+RADIUS_KM = road_distance_threshold_km / DETOUR_FACTOR
+print(f"[설정] 골든타임 {GOLDEN_TIME_MIN}분 -> 도로거리 {road_distance_threshold_km:.2f}km "
+      f"-> 직선거리 기준 반경 {RADIUS_KM:.2f}km")
+
+# =========================================================
+# 2. 최적화 설정값
+# =========================================================
+N_CANDIDATES = 2000     # 탐욕 알고리즘 후보지점 개수 (인구격자에서 다운샘플링)
+SA_ITERS = 2000
+RANDOM_SEED = 0
+
+
+# =========================================================
+# 3. 성남시 경계 로드
+# =========================================================
+with open(BOUNDARY_GEOJSON_PATH, encoding="utf-8") as f:
+    geojson_obj = json.load(f)
+
+def extract_city_polygons(geojson_obj, name_keys, keyword):
+    polygons = []
+    for feat in geojson_obj["features"]:
+        props = feat["properties"]
+        name_val = None
+        for k in name_keys:
+            if k in props and props[k] is not None:
+                name_val = str(props[k]); break
+        if name_val is None or keyword not in name_val:
+            continue
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            polygons.append(np.array(geom["coordinates"][0])[:, :2])
+        elif geom["type"] == "MultiPolygon":
+            for part in geom["coordinates"]:
+                polygons.append(np.array(part[0])[:, :2])
+    return polygons
+
+boundary_polys_lonlat = extract_city_polygons(geojson_obj, NAME_KEY_CANDIDATES, CITY_KEYWORD)
+transformer = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
+def transform_lonlat(arr_lonlat):
+    x, y = transformer.transform(arr_lonlat[:, 0], arr_lonlat[:, 1])
+    return np.column_stack([x, y])
+boundary_polys = [transform_lonlat(p) for p in boundary_polys_lonlat]
+
+def point_in_single_polygon(px, py, poly):
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]; xj, yj = poly[j]
+        cond = ((yi > py) != (yj > py)) & (px < (xj-xi)*(py-yi)/(yj-yi+1e-9)+xi)
+        inside ^= cond
+        j = i
+    return inside
+
+def point_in_city(px, py, polygons):
+    inside = np.zeros(len(px), dtype=bool)
+    for poly in polygons:
+        inside |= point_in_single_polygon(px, py, poly)
+    return inside
+
+all_pts = np.vstack(boundary_polys)
+xmin, ymin = all_pts.min(axis=0)
+xmax, ymax = all_pts.max(axis=0)
+
+
+# =========================================================
+# 4. 소방서 좌표 로드 (현재 실제 배치)
+# =========================================================
+df_fac = pd.read_csv(FACILITY_CSV_PATH, encoding="cp949")
+ADDRESS_COL = "주소"
+LAT_COL = "X좌표"
+LON_COL = "Y좌표"
+df_fac_seongnam = df_fac[df_fac[ADDRESS_COL].astype(str).str.contains(CITY_KEYWORD, na=False)]
+facility_lonlat = df_fac_seongnam[[LON_COL, LAT_COL]].to_numpy(dtype=float)
+points = transform_lonlat(facility_lonlat)
+
+# my_points_lonlat = np.array([
+#     [127.1577819, 37.4622093],
+#     [127.1726428, 37.4403259],
+#     [127.1339319, 37.4419263],
+#     [127.1477757, 37.4136388],
+#     [127.0974496, 37.4502686],
+#     [127.1119844, 37.4217394],
+#     [127.1010215, 37.3865732],
+#     [127.0822132, 37.3802743],
+#     [127.1178172, 37.3767960],
+#     [127.1435462, 37.3673784],
+#     [127.1275307, 37.3866004]
+# ])
+
+# points = transform_lonlat(my_points_lonlat)
+
+
+
+
+# =========================================================
+# [수동 보정] 성남소방서(공공데이터 주소: 수정구 제일로 111)는
+# 2022년 5월 중원구 하대원동 2로 신청사 이전. 공공데이터포털 CSV가
+# 구주소 기준으로 되어있어 실제 좌표로 직접 교체함.
+# 출처: 성남소방서 공식 홈페이지(119.gg.go.kr) "찾아오시는 길"
+# =========================================================
+seongnam_station_mask = df_fac_seongnam["소방서 및 안전센터명"] == "성남소방서"
+idx_in_points = np.where(seongnam_station_mask.to_numpy())[0][0]  # points 배열에서의 위치
+
+corrected = transform_lonlat(np.array([[127.1586809, 37.4223413]]))  # [경도, 위도] 순서 주의
+points[idx_in_points] = corrected[0]
+
+print(f"[확인] 성남시 소재 시설 개수: {len(points)}")
+
+print("총 시설 개수:", len(points))
+
+# 좌표가 완전히 같은(중복 위치) 시설 제거 - 먼저 나온 것만 유지
+_, unique_idx = np.unique(points.round(3), axis=0, return_index=True)
+unique_idx = np.sort(unique_idx)
+
+points = points[unique_idx]
+df_fac_seongnam = df_fac_seongnam.iloc[unique_idx].reset_index(drop=True)
+print(f"중복 제거 후 시설 개수: {len(points)}")
+
+
+# =========================================================
+# 5. 인구 격자 로드
+# =========================================================
+grid_gdf = gpd.read_file(GRID_BOUNDARY_PATH)
+if grid_gdf.crs is not None and grid_gdf.crs.to_epsg() != 5179:
+    grid_gdf = grid_gdf.to_crs(epsg=5179)
+
+pop_df = pd.read_csv(POPULATION_CSV_PATH, encoding="cp949", header=None,
+                      names=["year", "grid_id", "stat_cd", "value"])
+pop_total = pop_df[pop_df["stat_cd"] == "to_in_001"][["grid_id", "value"]].copy()
+pop_total.columns = ["GRID_CD", "population"]
+
+grid_gdf["GRID_CD"] = grid_gdf["GRID_CD"].astype(str)
+pop_total["GRID_CD"] = pop_total["GRID_CD"].astype(str)
+merged = grid_gdf.merge(pop_total, on="GRID_CD", how="left")
+merged["population"] = merged["population"].fillna(0)
+
+centroids = merged.geometry.centroid
+pop_xy_all = np.column_stack([centroids.x.to_numpy(), centroids.y.to_numpy()])
+pop_values_all = merged["population"].to_numpy(dtype=float)
+
+inside_mask = point_in_city(pop_xy_all[:, 0], pop_xy_all[:, 1], boundary_polys)
+pop_xy = pop_xy_all[inside_mask]
+pop_values = pop_values_all[inside_mask]
+print(f"[확인] 인구 격자 개수: {len(pop_xy):,}개, 총 인구: {pop_values.sum():,.0f}")
+
+
+# =========================================================
+# 6. 골든타임 커버리지율 계산 함수
+# =========================================================
+def compute_coverage(points, pop_xy, pop_values, radius_km):
+    tree = cKDTree(points)
+    distances, _ = tree.query(pop_xy)
+    covered = (distances / 1000) <= radius_km
+    return pop_values[covered].sum() / pop_values.sum()
+
+
+# =========================================================
+# 7. 탐욕 알고리즘 (Maximal Covering Location Problem)
+#    - 매번 "아직 커버 안 된 인구를 가장 많이 새로 커버하는" 후보지를 선택
+# =========================================================
+def greedy_mclp(candidates, pop_xy, pop_values, radius_km, n_facilities):
+    tree_pop = cKDTree(pop_xy)
+    covered_mask = np.zeros(len(pop_xy), dtype=bool)
+    selected = []
+    remaining = candidates.copy()
+
+    for step in range(n_facilities):
+        best_gain, best_i = -1, 0
+        for i, cand in enumerate(remaining):
+            idxs = tree_pop.query_ball_point(cand, r=radius_km * 1000)
+            newly = np.zeros(len(pop_xy), dtype=bool)
+            newly[idxs] = True
+            newly &= ~covered_mask
+            gain = pop_values[newly].sum()
+            if gain > best_gain:
+                best_gain, best_i = gain, i
+        chosen = remaining[best_i]
+        selected.append(chosen)
+        idxs = tree_pop.query_ball_point(chosen, r=radius_km * 1000)
+        covered_mask[idxs] = True
+        remaining = np.delete(remaining, best_i, axis=0)
+        print(f"  [탐욕 {step+1}/{n_facilities}] 누적 커버리지: "
+              f"{pop_values[covered_mask].sum()/pop_values.sum()*100:.1f}%")
+    return np.array(selected)
+
+
+# =========================================================
+# 8. 모의담금질로 미세 조정
+# =========================================================
+def sa_coverage(points, pop_xy, pop_values, radius_km, boundary_polys,
+                 xmin, xmax, ymin, ymax, n_iter, init_temp, cooling, step_frac, rng):
+    best_p = points.copy()
+    best_cov = compute_coverage(points, pop_xy, pop_values, radius_km)
+    cur_p = points.copy()
+    cur_cov = best_cov
+    T = init_temp
+    step = step_frac * (xmax - xmin)
+    for _ in range(n_iter):
+        idx = rng.integers(len(points))
+        newp = cur_p.copy()
+        cand = newp[idx] + rng.normal(0, step, size=2)
+        if not point_in_city(np.array([cand[0]]), np.array([cand[1]]), boundary_polys)[0]:
+            continue
+        newp[idx] = cand
+        new_cov = compute_coverage(newp, pop_xy, pop_values, radius_km)
+        delta = new_cov - cur_cov
+        if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-9)):
+            cur_p, cur_cov = newp, new_cov
+            if new_cov > best_cov:
+                best_cov, best_p = new_cov, newp.copy()
+        T *= cooling
+    return best_p, best_cov
+
+
+# =========================================================
+# 9. 현재 배치의 커버리지율
+# =========================================================
+coverage_current = compute_coverage(points, pop_xy, pop_values, RADIUS_KM)
+print(f"\n[현재 실제 배치] 골든타임({GOLDEN_TIME_MIN}분) 커버리지율: {coverage_current*100:.1f}%")
+
+
+# =========================================================
+# 10. 최적화: 탐욕 알고리즘 -> 모의담금질
+# =========================================================
+rng = np.random.default_rng(RANDOM_SEED)
+candidate_idx = rng.choice(len(pop_xy), size=min(N_CANDIDATES, len(pop_xy)), replace=False)
+candidates = pop_xy[candidate_idx]
+
+print("\n[탐욕 알고리즘 진행]")
+t0 = time.time()
+greedy_points = greedy_mclp(candidates, pop_xy, pop_values, RADIUS_KM, len(points))
+coverage_greedy = compute_coverage(greedy_points, pop_xy, pop_values, RADIUS_KM)
+print(f"탐욕 알고리즘 결과 커버리지율: {coverage_greedy*100:.1f}%  [{time.time()-t0:.1f}초]")
+
+t0 = time.time()
+final_points, coverage_final = sa_coverage(
+    greedy_points, pop_xy, pop_values, RADIUS_KM, boundary_polys,
+    xmin, xmax, ymin, ymax, n_iter=SA_ITERS,
+    init_temp=0.02, cooling=0.999, step_frac=0.015, rng=rng
+)
+print(f"모의담금질 후 최종 커버리지율: {coverage_final*100:.1f}%  [{time.time()-t0:.1f}초]")
+
+print("=" * 50)
+print(f"현재 실제 배치       커버리지율 = {coverage_current*100:.1f}%")
+print(f"최적화된 배치        커버리지율 = {coverage_final*100:.1f}%")
+print(f"개선폭               = {(coverage_final-coverage_current)*100:+.1f}%p")
+print("=" * 50)
+
+inv_transformer = Transformer.from_crs("EPSG:5179", "EPSG:4326", always_xy=True)
+lon, lat = inv_transformer.transform(final_points[:, 0], final_points[:, 1])
+print("\n최적 배치 좌표 (위도, 경도):")
+for la, lo in zip(lat, lon):
+    print(f"  {la:.6f}, {lo:.6f}")
+
+
+# =========================================================
+# 11. 시각화 (1) - 보로노이 셀 관점
+#     각 지점을 "가장 가까운 시설"로 배정(=보로노이 셀)한 뒤,
+#     그 배정된 시설까지의 거리가 골든타임 안인지/밖인지를
+#     같은 셀 색상 위에 표시(밖이면 x 표시)
+# =========================================================
+def plot_voronoi_goldentime(ax, points, pop_xy, pop_values, radius_km, boundary_polys, title, coverage):
+    n = len(points)
+    tree = cKDTree(points)
+    distances, nearest_idx = tree.query(pop_xy)
+    covered = (distances / 1000) <= radius_km
+
+    cmap = plt.get_cmap('tab20', n)
+    sizes = np.clip(pop_values / max(pop_values.max(), 1) * 15, 1, 15)
+
+    # 보로노이 셀 색상(시설별) - 골든타임 안(동그라미)
+    ax.scatter(pop_xy[covered, 0], pop_xy[covered, 1], c=nearest_idx[covered],
+               cmap=cmap, vmin=0, vmax=n-1, s=sizes[covered], marker='o', alpha=0.8)
+    # 같은 셀이지만 골든타임 밖(x 표시) - 셀 색은 유지하되 마커로 구분
+    ax.scatter(pop_xy[~covered, 0], pop_xy[~covered, 1], c=nearest_idx[~covered],
+               cmap=cmap, vmin=0, vmax=n-1, s=sizes[~covered]+4, marker='x', alpha=0.9)
+
+    for poly in boundary_polys:
+        poly_closed = np.vstack([poly, poly[0]])
+        ax.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', linewidth=0.6, alpha=0.7)
+
+    ax.plot(points[:, 0], points[:, 1], 'k^', markersize=9)
+    ax.set_aspect('equal')
+    ax.set_title(f"{title} - 보로노이 셀 기준\n(○ 골든타임 내 / × 골든타임 밖, 커버리지 {coverage*100:.1f}%)")
+
+
+# =========================================================
+# 12. 시각화 (2) - 커버리지(원) 관점
+# =========================================================
+def plot_coverage(ax, points, pop_xy, pop_values, radius_km, boundary_polys, title, coverage):
+    tree = cKDTree(points)
+    distances, _ = tree.query(pop_xy)
+    covered = (distances / 1000) <= radius_km
+
+    ax.scatter(pop_xy[~covered, 0], pop_xy[~covered, 1],
+               c='lightgray', s=np.clip(pop_values[~covered]/max(pop_values.max(),1)*15,1,15))
+    ax.scatter(pop_xy[covered, 0], pop_xy[covered, 1],
+               c='tomato', s=np.clip(pop_values[covered]/max(pop_values.max(),1)*15,1,15), alpha=0.7)
+
+    for poly in boundary_polys:
+        poly_closed = np.vstack([poly, poly[0]])
+        ax.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', linewidth=0.5, alpha=0.6)
+
+    for p in points:
+        circle = plt.Circle(p, radius_km * 1000, color='blue', fill=False, linewidth=0.8, alpha=0.5)
+        ax.add_patch(circle)
+    ax.plot(points[:, 0], points[:, 1], 'b^', markersize=9)
+
+    ax.set_aspect('equal')
+    ax.set_title(f"{title} - 커버리지(원) 기준\n골든타임 커버리지 {coverage*100:.1f}%")
+
+
+# =========================================================
+# 13. 2x2로 한 번에 비교 (위: 보로노이 셀 관점 / 아래: 원 관점)
+# =========================================================
+fig, axes = plt.subplots(2, 2, figsize=(14, 14))
+
+plot_voronoi_goldentime(axes[0, 0], points, pop_xy, pop_values, RADIUS_KM, boundary_polys,
+                         "현재 실제 배치", coverage_current)
+plot_voronoi_goldentime(axes[0, 1], final_points, pop_xy, pop_values, RADIUS_KM, boundary_polys,
+                         "최적화된 배치", coverage_final)
+plot_coverage(axes[1, 0], points, pop_xy, pop_values, RADIUS_KM, boundary_polys,
+              "현재 실제 배치", coverage_current)
+plot_coverage(axes[1, 1], final_points, pop_xy, pop_values, RADIUS_KM, boundary_polys,
+              "최적화된 배치", coverage_final)
+
+plt.tight_layout()
+plt.show()

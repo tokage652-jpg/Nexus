@@ -1,0 +1,241 @@
+import json
+import time
+import numpy as np
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from pyproj import Transformer
+
+plt.rcParams['font.family'] = 'Malgun Gothic'
+plt.rcParams['axes.unicode_minus'] = False
+
+# =========================================================
+# 0. 파일 경로 - 실제 경로로 수정
+# =========================================================
+BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\HangJeongDong_ver20260701.geojson"
+CITY_KEYWORD = "성남시"
+NAME_KEY_CANDIDATES = ["SIG_KOR_NM", "sggnm", "ADM_NM", "adm_nm", "SGG_NM", "sido_sgg_nm"]
+
+# =========================================================
+# 1. 설정값
+# =========================================================
+N_FACILITIES = 11
+GRID_RESOLUTION = 200     # 격자 해상도. 처음엔 낮게 테스트 후 필요시 상향
+N_RESTARTS = 5            # 다른 시작점에서 재시도 횟수
+LLOYD_ITERS = 20
+SA_ITERS = 1500
+RANDOM_SEED = 0
+
+
+# =========================================================
+# 2. 경계 GeoJSON에서 성남시 폴리곤 추출 + 좌표계 변환 (기존과 동일)
+# =========================================================
+with open(BOUNDARY_GEOJSON_PATH, encoding="utf-8") as f:
+    geojson_obj = json.load(f)
+
+def extract_city_polygons(geojson_obj, name_keys, keyword):
+    polygons = []
+    for feat in geojson_obj["features"]:
+        props = feat["properties"]
+        name_val = None
+        for k in name_keys:
+            if k in props and props[k] is not None:
+                name_val = str(props[k]); break
+        if name_val is None or keyword not in name_val:
+            continue
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            polygons.append(np.array(geom["coordinates"][0])[:, :2])
+        elif geom["type"] == "MultiPolygon":
+            for part in geom["coordinates"]:
+                polygons.append(np.array(part[0])[:, :2])
+    return polygons
+
+boundary_polys_lonlat = extract_city_polygons(geojson_obj, NAME_KEY_CANDIDATES, CITY_KEYWORD)
+print(f"[확인] '{CITY_KEYWORD}'로 매칭된 폴리곤 개수: {len(boundary_polys_lonlat)}")
+
+transformer = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
+def transform_lonlat(arr_lonlat):
+    x, y = transformer.transform(arr_lonlat[:, 0], arr_lonlat[:, 1])
+    return np.column_stack([x, y])
+
+boundary_polys = [transform_lonlat(p) for p in boundary_polys_lonlat]
+
+
+# =========================================================
+# 3. 경계 판정 및 랜덤 샘플링 함수
+# =========================================================
+def point_in_single_polygon(px, py, poly):
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]; xj, yj = poly[j]
+        cond = ((yi > py) != (yj > py)) & \
+               (px < (xj - xi) * (py - yi) / (yj - yi + 1e-9) + xi)
+        inside ^= cond
+        j = i
+    return inside
+
+def point_in_city(px, py, polygons):
+    inside = np.zeros(len(px), dtype=bool)
+    for poly in polygons:
+        inside |= point_in_single_polygon(px, py, poly)
+    return inside
+
+def random_points_in_boundary(n, boundary_polys, xmin, xmax, ymin, ymax, rng):
+    accepted = []
+    while len(accepted) < n:
+        need = n - len(accepted)
+        cx = rng.uniform(xmin, xmax, size=need * 4)
+        cy = rng.uniform(ymin, ymax, size=need * 4)
+        mask = point_in_city(cx, cy, boundary_polys)
+        accepted.extend(np.column_stack([cx[mask], cy[mask]])[:need].tolist())
+    return np.array(accepted[:n])
+
+
+# =========================================================
+# 4. 격자 생성 (한 번만 계산해서 재사용)
+# =========================================================
+all_pts = np.vstack(boundary_polys)
+xmin, ymin = all_pts.min(axis=0)
+xmax, ymax = all_pts.max(axis=0)
+
+xs = np.linspace(xmin, xmax, GRID_RESOLUTION)
+ys = np.linspace(ymin, ymax, GRID_RESOLUTION)
+gx, gy = np.meshgrid(xs, ys)
+gx_flat, gy_flat = gx.ravel(), gy.ravel()
+inside_mask = point_in_city(gx_flat, gy_flat, boundary_polys)
+grid_points = np.column_stack([gx_flat[inside_mask], gy_flat[inside_mask]])
+cell_area = (xmax - xmin) * (ymax - ymin) / (GRID_RESOLUTION ** 2)
+print(f"[확인] 경계 내부 격자점 개수: {len(grid_points):,}개")
+
+
+# =========================================================
+# 5. 공간 효율성 지표 E (km, km^2 단위)
+# =========================================================
+def compute_E(points, grid_points, cell_area):
+    tree = cKDTree(points)
+    distances, nearest_idx = tree.query(grid_points)
+    D_avg = distances.mean() / 1000
+    D_max = distances.max() / 1000
+    n = len(points)
+    cell_areas = np.array([np.sum(nearest_idx == i) * cell_area / 1e6 for i in range(n)])
+    A_bar = cell_areas.mean()
+    sigma_A = cell_areas.std()
+    CV_A = sigma_A / A_bar if A_bar > 0 else 0.0
+    return 1 / ((D_avg + D_max) * (1 + CV_A) * (D_max / D_avg))
+
+
+# =========================================================
+# 6. 로이드 알고리즘 (경계 밖으로 나가면 가장 가까운 내부 격자점으로 대체)
+# =========================================================
+def lloyd_relaxation(points, grid_points, boundary_polys, n_iter):
+    points = points.copy()
+    for _ in range(n_iter):
+        tree = cKDTree(points)
+        _, nearest_idx = tree.query(grid_points)
+        new_points = points.copy()
+        for i in range(len(points)):
+            assigned = grid_points[nearest_idx == i]
+            if len(assigned) > 0:
+                centroid = assigned.mean(axis=0)
+                if point_in_city(np.array([centroid[0]]), np.array([centroid[1]]), boundary_polys)[0]:
+                    new_points[i] = centroid
+                else:
+                    d = np.sum((assigned - centroid) ** 2, axis=1)
+                    new_points[i] = assigned[np.argmin(d)]
+        points = new_points
+    return points
+
+
+# =========================================================
+# 7. 모의담금질 (경계 밖으로 나가는 이동은 거부)
+# =========================================================
+def simulated_annealing(points, grid_points, cell_area, boundary_polys,
+                         xmin, xmax, ymin, ymax, n_iter, init_temp, cooling, step_frac, rng):
+    best_points = points.copy()
+    best_E = compute_E(points, grid_points, cell_area)
+    current_points = points.copy()
+    current_E = best_E
+    T = init_temp
+    step = step_frac * (xmax - xmin)
+    for _ in range(n_iter):
+        idx = rng.integers(len(points))
+        new_points = current_points.copy()
+        cand = new_points[idx] + rng.normal(0, step, size=2)
+        if not point_in_city(np.array([cand[0]]), np.array([cand[1]]), boundary_polys)[0]:
+            continue
+        new_points[idx] = cand
+        new_E = compute_E(new_points, grid_points, cell_area)
+        delta = new_E - current_E
+        if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-9)):
+            current_points = new_points
+            current_E = new_E
+            if new_E > best_E:
+                best_E = new_E
+                best_points = new_points.copy()
+        T *= cooling
+    return best_points, best_E
+
+
+# =========================================================
+# 8. N_RESTARTS번 반복해서 최고 결과 채택
+# =========================================================
+rng = np.random.default_rng(RANDOM_SEED)
+global_best_points = None
+global_best_E = -np.inf
+
+t0 = time.time()
+for restart in range(N_RESTARTS):
+    init_points = random_points_in_boundary(N_FACILITIES, boundary_polys, xmin, xmax, ymin, ymax, rng)
+    E_init = compute_E(init_points, grid_points, cell_area)
+
+    lloyd_points = lloyd_relaxation(init_points, grid_points, boundary_polys, LLOYD_ITERS)
+    E_lloyd = compute_E(lloyd_points, grid_points, cell_area)
+
+    final_points, E_final = simulated_annealing(
+        lloyd_points, grid_points, cell_area, boundary_polys,
+        xmin, xmax, ymin, ymax, n_iter=SA_ITERS,
+        init_temp=0.02, cooling=0.998, step_frac=0.02, rng=rng
+    )
+
+    print(f"[시도 {restart+1}/{N_RESTARTS}] 랜덤 E={E_init:.5f} -> 로이드 E={E_lloyd:.5f} -> 최종 E={E_final:.5f}")
+
+    if E_final > global_best_E:
+        global_best_E = E_final
+        global_best_points = final_points.copy()
+
+print(f"\n총 소요 시간: {time.time()-t0:.1f}초")
+print("=" * 45)
+print(f"{N_RESTARTS}번의 시도 중 최고 공간 효율성 지표: {global_best_E:.5f}")
+print("최적 시설 배치 좌표 (EPSG:5179, 미터):")
+print(np.round(global_best_points, 1))
+
+# 다시 위도/경도로 변환해서 실제 지도에서 확인할 수 있게 출력
+inv_transformer = Transformer.from_crs("EPSG:5179", "EPSG:4326", always_xy=True)
+lon, lat = inv_transformer.transform(global_best_points[:, 0], global_best_points[:, 1])
+print("\n최적 시설 배치 좌표 (위도, 경도) - 구글맵/카카오맵에 붙여넣어 확인 가능:")
+for la, lo in zip(lat, lon):
+    print(f"  {la:.6f}, {lo:.6f}")
+print("=" * 45)
+
+
+# =========================================================
+# 9. 시각화
+# =========================================================
+tree_after = cKDTree(global_best_points)
+_, idx_after = tree_after.query(grid_points)
+
+fig, ax = plt.subplots(figsize=(7, 7))
+cmap = plt.get_cmap('tab10', N_FACILITIES)
+ax.scatter(grid_points[:, 0], grid_points[:, 1], c=idx_after, cmap=cmap, s=2, marker='s')
+for poly in boundary_polys:
+    poly_closed = np.vstack([poly, poly[0]])
+    ax.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', linewidth=0.5, alpha=0.6)
+ax.plot(global_best_points[:, 0], global_best_points[:, 1], 'k^', markersize=10)
+ax.set_aspect('equal')
+ax.set_title(f"성남시 - 최적화된 시설 배치 (E = {global_best_E:.4f})")
+plt.tight_layout()
+plt.show()

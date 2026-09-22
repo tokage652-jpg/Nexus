@@ -1,0 +1,54 @@
+import matplotlib
+matplotlib.use('TkAgg')
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.spatial import Voronoi, voronoi_plot_2d
+
+# 랜덤 점 생성
+# points = np.array([
+#     [0.2, 0.3],
+#     [0.8, 0.2],
+#     [0.5, 0.7],
+#     [0.3, 0.8],
+#     [0.7, 0.2],
+#     [0.4, 0.6],
+#     [0.4, 0.9],
+#     [0.8, 0.1],
+#     [0.6, 0.3],
+#     [0.9, 0.5]
+# ])
+
+points = np.array([
+    [0.5, 0.9],
+    [0.4, 0.1],
+    [0.6, 0.4],
+    [0.2, 0.5],
+    [0.8, 0.6],
+    [0.9, 0.9],
+    [0.1, 0.2],
+    [0.2, 0.4],
+    [0.4, 0.2],
+    [0.3, 0.5]
+])
+
+
+# 보로노이 생성
+vor = Voronoi(points)
+
+# 그래프 출력
+fig = voronoi_plot_2d(vor, show_vertices=False)
+
+# 그래프 크기 조절
+fig.set_size_inches(5, 5)
+
+plt.xlim(0, 1)
+plt.ylim(0, 1)
+plt.gca().set_aspect('equal')
+
+# 점 표시
+plt.plot(points[:, 0], points[:, 1], 'ro')
+
+plt.title("Voronoi Diagram")
+
+plt.show()

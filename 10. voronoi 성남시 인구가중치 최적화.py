@@ -1,0 +1,300 @@
+import json
+import time
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+import matplotlib
+matplotlib.use('TkAgg')
+import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
+from pyproj import Transformer
+
+plt.rcParams['font.family'] = 'Malgun Gothic'
+plt.rcParams['axes.unicode_minus'] = False
+
+# =========================================================
+# 0. 파일 경로
+# =========================================================
+BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\HangJeongDong_ver20260701.geojson"
+FACILITY_CSV_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\소방서.csv"
+POPULATION_CSV_PATH = r"C:\Users\Lenovo\Downloads\_census_reqdoc_1784693050351\2024년_인구_다사_100M.csv"
+CITY_KEYWORD = "성남시"
+NAME_KEY_CANDIDATES = ["SIG_KOR_NM", "sggnm", "ADM_NM", "adm_nm", "SGG_NM", "sido_sgg_nm"]
+GRID_BOUNDARY_PATH = r"C:\Users\Lenovo\Downloads\_grid_border_grid_2025_grid_다사_grid_다사\grid_다사_100M.shp"
+
+# =========================================================
+# 1. 최적화 설정값
+# =========================================================
+N_RESTARTS = 5
+LLOYD_ITERS = 20
+SA_ITERS = 1500
+RANDOM_SEED = 0
+
+
+# =========================================================
+# 2. 성남시 경계 로드
+# =========================================================
+with open(BOUNDARY_GEOJSON_PATH, encoding="utf-8") as f:
+    geojson_obj = json.load(f)
+
+def extract_city_polygons(geojson_obj, name_keys, keyword):
+    polygons = []
+    for feat in geojson_obj["features"]:
+        props = feat["properties"]
+        name_val = None
+        for k in name_keys:
+            if k in props and props[k] is not None:
+                name_val = str(props[k]); break
+        if name_val is None or keyword not in name_val:
+            continue
+        geom = feat["geometry"]
+        if geom["type"] == "Polygon":
+            polygons.append(np.array(geom["coordinates"][0])[:, :2])
+        elif geom["type"] == "MultiPolygon":
+            for part in geom["coordinates"]:
+                polygons.append(np.array(part[0])[:, :2])
+    return polygons
+
+boundary_polys_lonlat = extract_city_polygons(geojson_obj, NAME_KEY_CANDIDATES, CITY_KEYWORD)
+transformer = Transformer.from_crs("EPSG:4326", "EPSG:5179", always_xy=True)
+def transform_lonlat(arr_lonlat):
+    x, y = transformer.transform(arr_lonlat[:, 0], arr_lonlat[:, 1])
+    return np.column_stack([x, y])
+boundary_polys = [transform_lonlat(p) for p in boundary_polys_lonlat]
+
+def point_in_single_polygon(px, py, poly):
+    n = len(poly)
+    inside = np.zeros(len(px), dtype=bool)
+    j = n - 1
+    for i in range(n):
+        xi, yi = poly[i]; xj, yj = poly[j]
+        cond = ((yi > py) != (yj > py)) & (px < (xj-xi)*(py-yi)/(yj-yi+1e-9)+xi)
+        inside ^= cond
+        j = i
+    return inside
+
+def point_in_city(px, py, polygons):
+    inside = np.zeros(len(px), dtype=bool)
+    for poly in polygons:
+        inside |= point_in_single_polygon(px, py, poly)
+    return inside
+
+def random_points_in_boundary(n, boundary_polys, xmin, xmax, ymin, ymax, rng):
+    accepted = []
+    while len(accepted) < n:
+        need = n - len(accepted)
+        cx = rng.uniform(xmin, xmax, size=need * 4)
+        cy = rng.uniform(ymin, ymax, size=need * 4)
+        mask = point_in_city(cx, cy, boundary_polys)
+        accepted.extend(np.column_stack([cx[mask], cy[mask]])[:need].tolist())
+    return np.array(accepted[:n])
+
+all_pts = np.vstack(boundary_polys)
+xmin, ymin = all_pts.min(axis=0)
+xmax, ymax = all_pts.max(axis=0)
+
+
+# =========================================================
+# 3. 소방서 좌표 로드 (현재 실제 배치)
+#    - 성남소방서 좌표 수동 보정(하대원동 신청사) + 중복 위치 제거 포함
+# =========================================================
+df_fac = pd.read_csv(FACILITY_CSV_PATH, encoding="cp949")
+ADDRESS_COL, LAT_COL, LON_COL = "주소", "X좌표", "Y좌표"
+df_fac_seongnam = df_fac[df_fac[ADDRESS_COL].astype(str).str.contains(CITY_KEYWORD, na=False)].reset_index(drop=True)
+facility_lonlat = df_fac_seongnam[[LON_COL, LAT_COL]].to_numpy(dtype=float)
+current_points = transform_lonlat(facility_lonlat)
+
+# [수동 보정] 성남소방서 최신 위치 (하대원동 신청사)로 교체
+mask = df_fac_seongnam["소방서 및 안전센터명"] == "성남소방서"
+idx = np.where(mask.to_numpy())[0][0]
+current_points[idx] = transform_lonlat(np.array([[127.1586809, 37.4223413]]))[0]
+print(f"[확인] 성남시 소재 시설 개수: {len(current_points)}")
+
+# 좌표가 완전히 같은(중복 위치) 시설 제거 - 먼저 나온 것만 유지
+_, unique_idx = np.unique(current_points.round(3), axis=0, return_index=True)
+unique_idx = np.sort(unique_idx)
+current_points = current_points[unique_idx]           # <- 중복 제거 결과를 current_points에 반영
+df_fac_seongnam = df_fac_seongnam.iloc[unique_idx].reset_index(drop=True)
+print(f"중복 제거 후 시설 개수: {len(current_points)}")
+
+N_FACILITIES = len(current_points)                     # <- 중복 제거 이후 개수로 다시 설정
+print(f"[확인] 최종 시설 개수(N_FACILITIES): {N_FACILITIES}")
+
+
+# =========================================================
+# 4. 인구 격자 로드
+# =========================================================
+grid_gdf = gpd.read_file(GRID_BOUNDARY_PATH)
+if grid_gdf.crs is not None and grid_gdf.crs.to_epsg() != 5179:
+    grid_gdf = grid_gdf.to_crs(epsg=5179)
+
+pop_df = pd.read_csv(POPULATION_CSV_PATH, encoding="cp949", header=None,
+                      names=["year", "grid_id", "stat_cd", "value"])
+pop_total = pop_df[pop_df["stat_cd"] == "to_in_001"][["grid_id", "value"]].copy()
+pop_total.columns = ["GRID_CD", "population"]
+
+grid_gdf["GRID_CD"] = grid_gdf["GRID_CD"].astype(str)
+pop_total["GRID_CD"] = pop_total["GRID_CD"].astype(str)
+merged = grid_gdf.merge(pop_total, on="GRID_CD", how="left")
+merged["population"] = merged["population"].fillna(0)
+
+centroids = merged.geometry.centroid
+pop_xy_all = np.column_stack([centroids.x.to_numpy(), centroids.y.to_numpy()])
+pop_values_all = merged["population"].to_numpy(dtype=float)
+
+inside_mask = point_in_city(pop_xy_all[:, 0], pop_xy_all[:, 1], boundary_polys)
+pop_xy = pop_xy_all[inside_mask]
+pop_values = pop_values_all[inside_mask]
+print(f"[확인] 인구 격자 개수: {len(pop_xy):,}개, 총 인구: {pop_values.sum():,.0f}")
+
+
+# =========================================================
+# 5. 인구가중 공간 효율성 지표 E
+# =========================================================
+def compute_E_weighted(points, pop_xy, pop_values):
+    tree = cKDTree(points)
+    distances, nearest_idx = tree.query(pop_xy)
+    d_km = distances / 1000
+    D_avg = np.sum(pop_values * d_km) / np.sum(pop_values)
+    D_max = d_km.max()
+    n = len(points)
+    pop_per = np.array([pop_values[nearest_idx == i].sum() for i in range(n)])
+    P_bar = pop_per.mean()
+    sigma_P = pop_per.std()
+    CV_P = sigma_P / P_bar if P_bar > 0 else 0.0
+    return 1 / ((D_avg + D_max) * (1 + CV_P) * (D_max / D_avg))
+
+
+# =========================================================
+# 6. 인구가중 로이드 알고리즘 (셀의 인구가중 무게중심으로 이동)
+# =========================================================
+def lloyd_weighted(points, pop_xy, pop_values, boundary_polys, n_iter):
+    points = points.copy()
+    for _ in range(n_iter):
+        tree = cKDTree(points)
+        _, nearest_idx = tree.query(pop_xy)
+        new_points = points.copy()
+        for i in range(len(points)):
+            m = nearest_idx == i
+            axy, aw = pop_xy[m], pop_values[m]
+            if len(axy) == 0:
+                continue
+            centroid = np.average(axy, axis=0, weights=aw) if aw.sum() > 0 else axy.mean(axis=0)
+            if point_in_city(np.array([centroid[0]]), np.array([centroid[1]]), boundary_polys)[0]:
+                new_points[i] = centroid
+            else:
+                d = np.sum((axy - centroid) ** 2, axis=1)
+                new_points[i] = axy[np.argmin(d)]
+        points = new_points
+    return points
+
+
+# =========================================================
+# 7. 모의담금질
+# =========================================================
+def simulated_annealing(points, pop_xy, pop_values, boundary_polys,
+                         xmin, xmax, ymin, ymax, n_iter, init_temp, cooling, step_frac, rng):
+    best_points = points.copy()
+    best_E = compute_E_weighted(points, pop_xy, pop_values)
+    current_points = points.copy()
+    current_E = best_E
+    T = init_temp
+    step = step_frac * (xmax - xmin)
+    for _ in range(n_iter):
+        idx = rng.integers(len(points))
+        new_points = current_points.copy()
+        cand = new_points[idx] + rng.normal(0, step, size=2)
+        if not point_in_city(np.array([cand[0]]), np.array([cand[1]]), boundary_polys)[0]:
+            continue
+        new_points[idx] = cand
+        new_E = compute_E_weighted(new_points, pop_xy, pop_values)
+        delta = new_E - current_E
+        if delta > 0 or rng.random() < np.exp(delta / max(T, 1e-9)):
+            current_points = new_points
+            current_E = new_E
+            if new_E > best_E:
+                best_E = new_E
+                best_points = new_points.copy()
+        T *= cooling
+    return best_points, best_E
+
+
+# =========================================================
+# 8. 현재 실제 배치의 E (비교 기준) + D_max 지점 정보 (한 번만 확인)
+# =========================================================
+E_current = compute_E_weighted(current_points, pop_xy, pop_values)
+print(f"\n[현재 실제 배치] 인구가중 공간 효율성 지표 E = {E_current:.6f}")
+
+tree_cur = cKDTree(current_points)
+distances_cur, _ = tree_cur.query(pop_xy)
+d_km_cur = distances_cur / 1000
+max_idx = np.argmax(d_km_cur)
+print(f"D_max 지점의 인구수: {pop_values[max_idx]}")
+print(f"D_max 지점 좌표(EPSG:5179): {pop_xy[max_idx]}")
+D_max_all = d_km_cur.max()
+inhabited = pop_values > 0
+D_max_inhabited = d_km_cur[inhabited].max()
+print(f"D_max(전체): {D_max_all:.3f} km")
+print(f"D_max(유인지역만): {D_max_inhabited:.3f} km")
+
+
+# =========================================================
+# 9. N_RESTARTS번 최적화 시도
+# =========================================================
+rng = np.random.default_rng(RANDOM_SEED)
+global_best_points, global_best_E = None, -np.inf
+
+t0 = time.time()
+for restart in range(N_RESTARTS):
+    init_points = random_points_in_boundary(N_FACILITIES, boundary_polys, xmin, xmax, ymin, ymax, rng)
+    lloyd_points = lloyd_weighted(init_points, pop_xy, pop_values, boundary_polys, LLOYD_ITERS)
+    final_points, E_final = simulated_annealing(
+        lloyd_points, pop_xy, pop_values, boundary_polys,
+        xmin, xmax, ymin, ymax, n_iter=SA_ITERS,
+        init_temp=0.02, cooling=0.998, step_frac=0.02, rng=rng
+    )
+    print(f"[시도 {restart+1}/{N_RESTARTS}] 최종 E = {E_final:.6f}")
+    if E_final > global_best_E:
+        global_best_E = E_final
+        global_best_points = final_points.copy()
+
+print(f"\n총 소요시간: {time.time()-t0:.1f}초")
+print("=" * 50)
+print(f"현재 실제 배치       E = {E_current:.6f}")
+print(f"이론적 최적 배치      E = {global_best_E:.6f}")
+print(f"개선 배수            : {global_best_E/E_current:.2f}배")
+print("=" * 50)
+
+inv_transformer = Transformer.from_crs("EPSG:5179", "EPSG:4326", always_xy=True)
+lon, lat = inv_transformer.transform(global_best_points[:, 0], global_best_points[:, 1])
+print("\n최적 배치 좌표 (위도, 경도):")
+for la, lo in zip(lat, lon):
+    print(f"  {la:.6f}, {lo:.6f}")
+
+
+# =========================================================
+# 10. 시각화: 현재 배치 vs 최적화된 배치
+# =========================================================
+tree_cur2 = cKDTree(current_points)
+_, idx_cur = tree_cur2.query(pop_xy)
+tree_opt = cKDTree(global_best_points)
+_, idx_opt = tree_opt.query(pop_xy)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 7))
+cmap = plt.get_cmap('tab20', N_FACILITIES)
+sizes = np.clip(pop_values / max(pop_values.max(), 1) * 15, 1, 15)
+
+for ax, idx_arr, pts, title, E_val in [
+    (axes[0], idx_cur, current_points, "현재 실제 배치", E_current),
+    (axes[1], idx_opt, global_best_points, "이론적 최적 배치", global_best_E),
+]:
+    ax.scatter(pop_xy[:, 0], pop_xy[:, 1], c=idx_arr, cmap=cmap, s=sizes, alpha=0.7)
+    for poly in boundary_polys:
+        poly_closed = np.vstack([poly, poly[0]])
+        ax.plot(poly_closed[:, 0], poly_closed[:, 1], 'k-', linewidth=0.5, alpha=0.6)
+    ax.plot(pts[:, 0], pts[:, 1], 'k^', markersize=9)
+    ax.set_aspect('equal')
+    ax.set_title(f"{title}  (E = {E_val:.4f})")
+
+plt.tight_layout()
+plt.show()
