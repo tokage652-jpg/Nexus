@@ -13,7 +13,7 @@ plt.rcParams['axes.unicode_minus'] = False
 # =========================================================
 # 0. 파일 경로 - 실제 경로로 수정
 # =========================================================
-BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 보평고등학교\바탕 화면\유은\02. 2026\01. 학교\04. 학술제\HangJeongDong_ver20260701.geojson"
+BOUNDARY_GEOJSON_PATH = r"C:\Users\Lenovo\OneDrive - 파일경로"
 CITY_KEYWORD = "성남시"
 NAME_KEY_CANDIDATES = ["SIG_KOR_NM", "sggnm", "ADM_NM", "adm_nm", "SGG_NM", "sido_sgg_nm"]
 
